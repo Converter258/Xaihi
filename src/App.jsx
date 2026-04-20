@@ -39,6 +39,96 @@ function getBaseName(targetPath) {
   return segments.length > 0 ? segments[segments.length - 1] : targetPath;
 }
 
+function normalizePathForCompare(targetPath) {
+  return targetPath.replace(/\//g, "\\").replace(/\\+$/g, "").toLowerCase();
+}
+
+function isSameOrChildPath(targetPath, basePath) {
+  const normalizedTarget = normalizePathForCompare(targetPath);
+  const normalizedBase = normalizePathForCompare(basePath);
+  return (
+    normalizedTarget === normalizedBase || normalizedTarget.startsWith(`${normalizedBase}\\`)
+  );
+}
+
+function replacePathPrefix(targetPath, sourcePrefix, nextPrefix) {
+  if (!targetPath || !sourcePrefix) {
+    return targetPath;
+  }
+
+  const normalizedTarget = normalizePathForCompare(targetPath);
+  const normalizedSource = normalizePathForCompare(sourcePrefix);
+  if (normalizedTarget === normalizedSource) {
+    return nextPrefix;
+  }
+
+  const prefixWithSeparator = `${normalizedSource}\\`;
+  if (!normalizedTarget.startsWith(prefixWithSeparator)) {
+    return targetPath;
+  }
+
+  const suffix = targetPath.slice(sourcePrefix.length);
+  return `${nextPrefix}${suffix}`;
+}
+
+function findTreeNodeByPath(node, targetPath) {
+  if (!node) {
+    return null;
+  }
+
+  if (node.path === targetPath) {
+    return node;
+  }
+
+  for (const child of node.children ?? []) {
+    const match = findTreeNodeByPath(child, targetPath);
+    if (match) {
+      return match;
+    }
+  }
+
+  return null;
+}
+
+function getParentDirectoryPath(targetPath) {
+  const separatorsPattern = /[/\\]+/g;
+  const normalizedPath = targetPath.replace(separatorsPattern, "\\");
+  const lastSeparatorIndex = normalizedPath.lastIndexOf("\\");
+  if (lastSeparatorIndex <= 1) {
+    return normalizedPath;
+  }
+  return normalizedPath.slice(0, lastSeparatorIndex);
+}
+
+function validateEntryName(inputValue) {
+  const nextName = inputValue.trim();
+  if (!nextName) {
+    return "名称不能为空。";
+  }
+
+  if (nextName === "." || nextName === "..") {
+    return "名称不能为 . 或 ..";
+  }
+
+  if (nextName.includes("/") || nextName.includes("\\")) {
+    return "名称不能包含路径分隔符。";
+  }
+
+  return "";
+}
+
+function getContextTargetDirectoryPath(node, rootPath) {
+  if (!node) {
+    return rootPath ?? "";
+  }
+
+  if (node.type === "directory") {
+    return node.path;
+  }
+
+  return getParentDirectoryPath(node.path);
+}
+
 function inferLanguageByPath(filePath) {
   if (!filePath) {
     return "plaintext";
@@ -105,7 +195,14 @@ function updateTreeNode(node, targetPath, updater) {
   return changed ? { ...node, children: nextChildren } : node;
 }
 
-function ExplorerNode({ node, depth, activeFilePath, onToggleDirectory, onOpenFile }) {
+function ExplorerNode({
+  node,
+  depth,
+  activeFilePath,
+  onToggleDirectory,
+  onOpenFile,
+  onContextMenuNode,
+}) {
   const isDirectory = node.type === "directory";
   const isActiveFile = !isDirectory && activeFilePath === node.path;
   const icon = isDirectory ? (node.isExpanded ? "▾" : "▸") : "•";
@@ -119,6 +216,11 @@ function ExplorerNode({ node, depth, activeFilePath, onToggleDirectory, onOpenFi
         }`}
         style={{ paddingLeft: `${depth * 14 + 8}px` }}
         onClick={() => (isDirectory ? onToggleDirectory(node) : onOpenFile(node))}
+        onContextMenu={(event) => {
+          event.preventDefault();
+          event.stopPropagation();
+          onContextMenuNode(event, node);
+        }}
       >
         <span className={`w-3 ${isActiveFile ? "text-white" : "text-vscode-muted"}`}>{icon}</span>
         <span className="truncate">{node.name}</span>
@@ -145,6 +247,7 @@ function ExplorerNode({ node, depth, activeFilePath, onToggleDirectory, onOpenFi
             activeFilePath={activeFilePath}
             onToggleDirectory={onToggleDirectory}
             onOpenFile={onOpenFile}
+            onContextMenuNode={onContextMenuNode}
           />
         ))}
     </div>
@@ -165,6 +268,8 @@ function App() {
   const [isStatusBarCollapsed, setStatusBarCollapsed] = useState(true);
   const [terminalWidth, setTerminalWidth] = useState(() => getInitialTerminalWidth());
   const [isResizing, setResizing] = useState(false);
+  const [contextMenu, setContextMenu] = useState(null);
+  const [clipboardEntry, setClipboardEntry] = useState(null);
   const terminalWidthRef = useRef(terminalWidth);
 
   const apiReady = Boolean(window.xaihi?.wsl);
@@ -234,6 +339,79 @@ function App() {
       }
     },
     [listDirectory],
+  );
+
+  const closeContextMenu = useCallback(() => {
+    setContextMenu(null);
+  }, []);
+
+  const openContextMenu = useCallback((event, node, scope) => {
+    if (!rootNode?.path) {
+      return;
+    }
+
+    const targetDirPath = getContextTargetDirectoryPath(node, rootNode.path);
+    const menuWidth = 184;
+    const menuHeight = 240;
+    const x = Math.max(8, Math.min(event.clientX, window.innerWidth - menuWidth));
+    const y = Math.max(8, Math.min(event.clientY, window.innerHeight - menuHeight));
+
+    setContextMenu({
+      x,
+      y,
+      scope,
+      node: node ?? null,
+      targetDirPath,
+    });
+  }, [rootNode]);
+
+  const refreshDirectoryNode = useCallback(
+    async (targetPath) => {
+      if (!targetPath || !rootNode?.path) {
+        return;
+      }
+
+      try {
+        const children = await listDirectory(targetPath);
+        const targetNode = findTreeNodeByPath(rootNode, targetPath);
+
+        if (!targetNode) {
+          await loadRootDirectory(rootNode.path);
+          return;
+        }
+
+        setRootNode((previous) => {
+          if (!previous) {
+            return previous;
+          }
+
+          if (previous.path === targetPath) {
+            return {
+              ...previous,
+              isLoaded: true,
+              isLoading: false,
+              isExpanded: true,
+              error: null,
+              children,
+            };
+          }
+
+          return updateTreeNode(previous, targetPath, (current) => ({
+            ...current,
+            isLoaded: true,
+            isLoading: false,
+            isExpanded: true,
+            error: null,
+            children,
+          }));
+        });
+        setStatusMessage("");
+      } catch (error) {
+        const errorMessage = error instanceof Error ? error.message : "目录刷新失败。";
+        setStatusMessage(`刷新目录失败：${errorMessage}`);
+      }
+    },
+    [listDirectory, loadRootDirectory, rootNode],
   );
 
   const handleToggleDirectory = useCallback(
@@ -317,6 +495,271 @@ function App() {
     }
   }, [activeFilePath, editorValue]);
 
+  const clearActiveFileState = useCallback(() => {
+    setActiveFilePath("");
+    setEditorValue(emptyFileHint);
+    setLastSavedValue(emptyFileHint);
+  }, []);
+
+  const getCrudApi = useCallback(() => {
+    const api = window.xaihi?.wsl;
+    if (
+      !api?.createFile ||
+      !api?.createDirectory ||
+      !api?.copy ||
+      !api?.rename ||
+      !api?.delete
+    ) {
+      throw new Error("Explorer CRUD IPC 未就绪，请通过 Electron 启动应用。");
+    }
+    return api;
+  }, []);
+
+  const handleExplorerNodeContextMenu = useCallback(
+    (event, node) => {
+      openContextMenu(event, node, "node");
+    },
+    [openContextMenu],
+  );
+
+  const handleExplorerBlankContextMenu = useCallback(
+    (event) => {
+      event.preventDefault();
+      openContextMenu(event, null, "blank");
+    },
+    [openContextMenu],
+  );
+
+  const handleCreateEntry = useCallback(
+    async (entryType, targetDirPath) => {
+      const defaultName = entryType === "file" ? "untitled.txt" : "新建文件夹";
+      const dialogTitle = entryType === "file" ? "请输入新文件名称：" : "请输入新文件夹名称：";
+      const inputValue = window.prompt(dialogTitle, defaultName);
+      if (inputValue === null) {
+        return;
+      }
+
+      const nameError = validateEntryName(inputValue);
+      if (nameError) {
+        setStatusMessage(nameError);
+        return;
+      }
+
+      const api = getCrudApi();
+      if (entryType === "file") {
+        await api.createFile({
+          dirPath: targetDirPath,
+          name: inputValue.trim(),
+        });
+      } else {
+        await api.createDirectory({
+          dirPath: targetDirPath,
+          name: inputValue.trim(),
+        });
+      }
+
+      await refreshDirectoryNode(targetDirPath);
+      setStatusMessage("");
+    },
+    [getCrudApi, refreshDirectoryNode],
+  );
+
+  const handlePasteEntry = useCallback(
+    async (targetDirPath) => {
+      if (!clipboardEntry) {
+        setStatusMessage("剪贴板为空，无法粘贴。");
+        return;
+      }
+
+      const api = getCrudApi();
+      await api.copy({
+        sourcePath: clipboardEntry.path,
+        targetDirPath,
+      });
+
+      await refreshDirectoryNode(targetDirPath);
+      setStatusMessage("");
+    },
+    [clipboardEntry, getCrudApi, refreshDirectoryNode],
+  );
+
+  const handleRenameEntry = useCallback(
+    async (node) => {
+      const inputValue = window.prompt("请输入新名称：", node.name);
+      if (inputValue === null) {
+        return;
+      }
+
+      const nameError = validateEntryName(inputValue);
+      if (nameError) {
+        setStatusMessage(nameError);
+        return;
+      }
+
+      const nextName = inputValue.trim();
+      if (!window.confirm(`确认将 ${node.name} 重命名为 ${nextName} 吗？`)) {
+        return;
+      }
+
+      const api = getCrudApi();
+      const result = await api.rename({
+        targetPath: node.path,
+        newName: nextName,
+      });
+
+      if (rootNode?.path === node.path) {
+        setRootInputPath(result.path);
+        await loadRootDirectory(result.path);
+      } else {
+        await refreshDirectoryNode(getParentDirectoryPath(node.path));
+      }
+
+      setActiveFilePath((previousPath) => {
+        if (!previousPath) {
+          return previousPath;
+        }
+
+        if (node.type === "file") {
+          return previousPath === node.path ? result.path : previousPath;
+        }
+
+        return isSameOrChildPath(previousPath, node.path)
+          ? replacePathPrefix(previousPath, node.path, result.path)
+          : previousPath;
+      });
+      setStatusMessage("");
+    },
+    [getCrudApi, loadRootDirectory, refreshDirectoryNode, rootNode],
+  );
+
+  const handleDeleteEntry = useCallback(
+    async (node) => {
+      const targetLabel = node.type === "directory" ? "文件夹" : "文件";
+      if (!window.confirm(`确认删除${targetLabel} ${node.name} 吗？此操作不可恢复。`)) {
+        return;
+      }
+
+      const api = getCrudApi();
+      await api.delete({
+        targetPath: node.path,
+      });
+
+      if (activeFilePath && isSameOrChildPath(activeFilePath, node.path)) {
+        clearActiveFileState();
+      }
+
+      setClipboardEntry((previous) => {
+        if (!previous) {
+          return previous;
+        }
+        return isSameOrChildPath(previous.path, node.path) ? null : previous;
+      });
+
+      if (rootNode?.path === node.path) {
+        setRootNode(null);
+      } else {
+        await refreshDirectoryNode(getParentDirectoryPath(node.path));
+      }
+
+      setStatusMessage("");
+    },
+    [activeFilePath, clearActiveFileState, getCrudApi, refreshDirectoryNode, rootNode],
+  );
+
+  const contextMenuItems = useMemo(() => {
+    if (!contextMenu) {
+      return [];
+    }
+
+    const node = contextMenu.node;
+    if (contextMenu.scope === "blank") {
+      return [
+        { key: "new-file", label: "新建文件", disabled: false },
+        { key: "new-folder", label: "新建文件夹", disabled: false },
+        { key: "paste", label: "粘贴", disabled: !clipboardEntry },
+      ];
+    }
+
+    if (!node) {
+      return [];
+    }
+
+    if (node.type === "file") {
+      return [
+        { key: "copy", label: "复制", disabled: false },
+        { key: "rename", label: "重命名", disabled: false },
+        { key: "delete", label: "删除", disabled: false },
+      ];
+    }
+
+    return [
+      { key: "new-file", label: "新建文件", disabled: false },
+      { key: "new-folder", label: "新建文件夹", disabled: false },
+      { key: "copy", label: "复制", disabled: false },
+      { key: "paste", label: "粘贴", disabled: !clipboardEntry },
+      { key: "rename", label: "重命名", disabled: false },
+      { key: "delete", label: "删除", disabled: false },
+    ];
+  }, [clipboardEntry, contextMenu]);
+
+  const handleContextMenuAction = useCallback(
+    async (actionKey) => {
+      if (!contextMenu) {
+        return;
+      }
+
+      const menuSnapshot = contextMenu;
+      closeContextMenu();
+
+      try {
+        if (actionKey === "new-file") {
+          await handleCreateEntry("file", menuSnapshot.targetDirPath);
+          return;
+        }
+
+        if (actionKey === "new-folder") {
+          await handleCreateEntry("directory", menuSnapshot.targetDirPath);
+          return;
+        }
+
+        if (actionKey === "copy" && menuSnapshot.node) {
+          setClipboardEntry({
+            path: menuSnapshot.node.path,
+            type: menuSnapshot.node.type,
+            name: menuSnapshot.node.name,
+          });
+          setStatusMessage("");
+          return;
+        }
+
+        if (actionKey === "paste") {
+          await handlePasteEntry(menuSnapshot.targetDirPath);
+          return;
+        }
+
+        if (actionKey === "rename" && menuSnapshot.node) {
+          await handleRenameEntry(menuSnapshot.node);
+          return;
+        }
+
+        if (actionKey === "delete" && menuSnapshot.node) {
+          await handleDeleteEntry(menuSnapshot.node);
+        }
+      } catch (error) {
+        const errorMessage = error instanceof Error ? error.message : "Explorer 操作失败。";
+        setStatusMessage(errorMessage);
+      }
+    },
+    [
+      closeContextMenu,
+      contextMenu,
+      handleCreateEntry,
+      handleDeleteEntry,
+      handlePasteEntry,
+      handleRenameEntry,
+    ],
+  );
+
   const handleResizerMouseDown = useCallback(
     (event) => {
       if (isTerminalCollapsed) {
@@ -328,6 +771,20 @@ function App() {
     },
     [isTerminalCollapsed],
   );
+
+  const handleOpenSettingsWindow = useCallback(async () => {
+    if (!window.xaihi?.openSettingsWindow) {
+      setStatusMessage("设置窗口 IPC 未就绪，请通过 Electron 启动应用。");
+      return;
+    }
+
+    try {
+      await window.xaihi.openSettingsWindow();
+    } catch (error) {
+      const errorMessage = error instanceof Error ? error.message : "打开设置窗口失败。";
+      setStatusMessage(`打开设置失败：${errorMessage}`);
+    }
+  }, []);
 
   useEffect(() => {
     if (!apiReady) {
@@ -391,10 +848,57 @@ function App() {
     };
   }, [isResizing]);
 
+  useEffect(() => {
+    if (!contextMenu) {
+      return undefined;
+    }
+
+    const onMouseDown = (event) => {
+      if (event.target instanceof Element && event.target.closest("[data-explorer-context-menu='true']")) {
+        return;
+      }
+      closeContextMenu();
+    };
+
+    const onKeyDown = (event) => {
+      if (event.key === "Escape") {
+        closeContextMenu();
+      }
+    };
+
+    const closeOnViewportChange = () => {
+      closeContextMenu();
+    };
+
+    window.addEventListener("mousedown", onMouseDown);
+    window.addEventListener("keydown", onKeyDown);
+    window.addEventListener("resize", closeOnViewportChange);
+    window.addEventListener("scroll", closeOnViewportChange, true);
+
+    return () => {
+      window.removeEventListener("mousedown", onMouseDown);
+      window.removeEventListener("keydown", onKeyDown);
+      window.removeEventListener("resize", closeOnViewportChange);
+      window.removeEventListener("scroll", closeOnViewportChange, true);
+    };
+  }, [closeContextMenu, contextMenu]);
+
+  useEffect(() => {
+    if (isExplorerCollapsed) {
+      closeContextMenu();
+    }
+  }, [closeContextMenu, isExplorerCollapsed]);
+
   return (
     <div className="relative flex h-screen w-screen flex-col bg-vscode-bg text-vscode-text">
       <header className="flex h-10 items-center justify-between border-b border-vscode-border bg-[#2d2d2d] px-4 text-xs uppercase tracking-wide text-vscode-muted">
-        <div className="h-4 w-24" />
+        <button
+          type="button"
+          className="h-7 rounded px-3 text-[11px] font-medium normal-case text-vscode-text hover:bg-vscode-hover"
+          onClick={() => void handleOpenSettingsWindow()}
+        >
+          Options
+        </button>
         <div className="flex items-center gap-2">
           <span className="h-3 w-3 rounded-sm border border-vscode-border bg-[#3a3a3a]" />
           <span className="h-3 w-3 rounded-sm border border-vscode-border bg-[#3a3a3a]" />
@@ -436,7 +940,10 @@ function App() {
                 </button>
               </div>
 
-              <div className="min-h-0 flex-1 overflow-auto px-2 py-2">
+              <div
+                className="min-h-0 flex-1 overflow-auto px-2 py-2"
+                onContextMenu={handleExplorerBlankContextMenu}
+              >
                 {rootNode ? (
                   <ExplorerNode
                     node={rootNode}
@@ -444,6 +951,7 @@ function App() {
                     activeFilePath={activeFilePath}
                     onToggleDirectory={handleToggleDirectory}
                     onOpenFile={handleOpenFile}
+                    onContextMenuNode={handleExplorerNodeContextMenu}
                   />
                 ) : (
                   <div className="px-2 text-xs text-vscode-muted">暂无目录</div>
@@ -511,6 +1019,31 @@ function App() {
           </div>
         </section>
       </main>
+
+      {contextMenu && (
+        <div
+          data-explorer-context-menu="true"
+          className="fixed z-40 min-w-[176px] overflow-hidden rounded border border-vscode-border bg-[#252526] py-1 shadow-2xl"
+          style={{ left: contextMenu.x, top: contextMenu.y }}
+          onContextMenu={(event) => event.preventDefault()}
+        >
+          {contextMenuItems.map((item) => (
+            <button
+              key={item.key}
+              type="button"
+              className={`flex h-8 w-full items-center px-3 text-left text-xs ${
+                item.disabled
+                  ? "cursor-not-allowed text-vscode-muted/60"
+                  : "text-vscode-text hover:bg-vscode-hover"
+              }`}
+              disabled={item.disabled}
+              onClick={() => void handleContextMenuAction(item.key)}
+            >
+              {item.label}
+            </button>
+          ))}
+        </div>
+      )}
 
       {!isStatusBarCollapsed && (
         <footer className="flex h-7 items-center border-t border-vscode-border bg-vscode-panel px-3 text-xs text-vscode-muted">

@@ -1,11 +1,35 @@
 const { app, BrowserWindow, ipcMain, webContents } = require("electron");
 const fs = require("fs/promises");
+const { constants: fsConstants } = require("fs");
 const path = require("path");
 const pty = require("node-pty");
 
 const isDev = !app.isPackaged;
 const WSL_PREFIXES = ["\\\\wsl.localhost\\", "\\\\wsl$\\"];
 const terminalSessions = new Map();
+const SETTINGS_WINDOW_HTML = `<!doctype html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>设置</title>
+    <style>
+      :root {
+        color-scheme: dark;
+      }
+      html,
+      body {
+        width: 100%;
+        height: 100%;
+        margin: 0;
+        background: #1e1e1e;
+      }
+    </style>
+  </head>
+  <body></body>
+</html>`;
+
+let settingsWindow = null;
 
 function normalizeWslPath(inputPath) {
   if (typeof inputPath !== "string" || inputPath.trim() === "") {
@@ -21,6 +45,39 @@ function normalizeWslPath(inputPath) {
   }
 
   return normalizedPath;
+}
+
+function normalizeEntryName(inputName) {
+  if (typeof inputName !== "string") {
+    throw new Error("名称不能为空。");
+  }
+
+  const nextName = inputName.trim();
+  if (!nextName) {
+    throw new Error("名称不能为空。");
+  }
+
+  if (nextName === "." || nextName === "..") {
+    throw new Error("名称不能为 . 或 ..");
+  }
+
+  if (nextName.includes("/") || nextName.includes("\\")) {
+    throw new Error("名称不能包含路径分隔符。");
+  }
+
+  return nextName;
+}
+
+async function ensureDirectory(targetPath, message) {
+  const stats = await fs.stat(targetPath);
+  if (!stats.isDirectory()) {
+    throw new Error(message);
+  }
+}
+
+async function getEntryType(targetPath) {
+  const stats = await fs.stat(targetPath);
+  return stats.isDirectory() ? "directory" : "file";
 }
 
 function registerIpcHandlers() {
@@ -101,6 +158,94 @@ function registerIpcHandlers() {
     };
   });
 
+  ipcMain.handle("wsl:create-file", async (_, payload) => {
+    const dirPath = normalizeWslPath(payload?.dirPath);
+    const name = normalizeEntryName(payload?.name);
+    await ensureDirectory(dirPath, "目标目录不存在，无法创建文件。");
+
+    const targetPath = path.win32.join(dirPath, name);
+    await fs.writeFile(targetPath, "", { encoding: "utf8", flag: "wx" });
+
+    return {
+      path: targetPath,
+      type: "file",
+    };
+  });
+
+  ipcMain.handle("wsl:create-directory", async (_, payload) => {
+    const dirPath = normalizeWslPath(payload?.dirPath);
+    const name = normalizeEntryName(payload?.name);
+    await ensureDirectory(dirPath, "目标目录不存在，无法创建文件夹。");
+
+    const targetPath = path.win32.join(dirPath, name);
+    await fs.mkdir(targetPath, { recursive: false });
+
+    return {
+      path: targetPath,
+      type: "directory",
+    };
+  });
+
+  ipcMain.handle("wsl:copy", async (_, payload) => {
+    const sourcePath = normalizeWslPath(payload?.sourcePath);
+    const targetDirPath = normalizeWslPath(payload?.targetDirPath);
+    await ensureDirectory(targetDirPath, "目标目录不存在，无法粘贴。");
+
+    const sourceType = await getEntryType(sourcePath);
+    const targetPath = path.win32.join(targetDirPath, path.win32.basename(sourcePath));
+
+    if (sourceType === "directory") {
+      await fs.cp(sourcePath, targetPath, {
+        recursive: true,
+        errorOnExist: true,
+        force: false,
+      });
+    } else {
+      await fs.copyFile(sourcePath, targetPath, fsConstants.COPYFILE_EXCL);
+    }
+
+    return {
+      path: targetPath,
+      type: sourceType,
+    };
+  });
+
+  ipcMain.handle("wsl:rename", async (_, payload) => {
+    const targetPath = normalizeWslPath(payload?.targetPath);
+    const newName = normalizeEntryName(payload?.newName);
+    const parentPath = path.win32.dirname(targetPath);
+    await ensureDirectory(parentPath, "父目录不存在，无法重命名。");
+
+    const nextPath = path.win32.join(parentPath, newName);
+    if (nextPath === targetPath) {
+      throw new Error("新名称与原名称相同。");
+    }
+
+    const targetType = await getEntryType(targetPath);
+    await fs.rename(targetPath, nextPath);
+
+    return {
+      path: nextPath,
+      type: targetType,
+    };
+  });
+
+  ipcMain.handle("wsl:delete", async (_, payload) => {
+    const targetPath = normalizeWslPath(payload?.targetPath);
+    const targetType = await getEntryType(targetPath);
+
+    if (targetType === "directory") {
+      await fs.rm(targetPath, { recursive: true, force: false });
+    } else {
+      await fs.unlink(targetPath);
+    }
+
+    return {
+      path: targetPath,
+      type: targetType,
+    };
+  });
+
   ipcMain.handle("terminal:start", async (event, payload) => {
     const senderId = event.sender.id;
     const cols = Number.isInteger(payload?.cols) && payload.cols > 0 ? payload.cols : 80;
@@ -176,6 +321,12 @@ function registerIpcHandlers() {
     stopTerminalSession(event.sender.id);
     return { ok: true };
   });
+
+  ipcMain.handle("window:open-settings", async (event) => {
+    const parentWindow = BrowserWindow.fromWebContents(event.sender);
+    createSettingsWindow(parentWindow ?? undefined);
+    return { ok: true };
+  });
 }
 
 function sendToRenderer(webContentsId, channel, payload) {
@@ -199,6 +350,41 @@ function stopTerminalSession(webContentsId) {
     // Ignore kill errors during shutdown/reload.
   }
   terminalSessions.delete(webContentsId);
+}
+
+function createSettingsWindow(parentWindow) {
+  if (settingsWindow && !settingsWindow.isDestroyed()) {
+    settingsWindow.focus();
+    return settingsWindow;
+  }
+
+  settingsWindow = new BrowserWindow({
+    width: 860,
+    height: 620,
+    minWidth: 560,
+    minHeight: 420,
+    backgroundColor: "#1e1e1e",
+    title: "设置",
+    autoHideMenuBar: true,
+    show: false,
+    parent: parentWindow,
+    webPreferences: {
+      contextIsolation: true,
+      nodeIntegration: false,
+      sandbox: true,
+    },
+  });
+
+  settingsWindow.once("ready-to-show", () => {
+    settingsWindow?.show();
+  });
+
+  settingsWindow.on("closed", () => {
+    settingsWindow = null;
+  });
+
+  settingsWindow.loadURL(`data:text/html;charset=UTF-8,${encodeURIComponent(SETTINGS_WINDOW_HTML)}`);
+  return settingsWindow;
 }
 
 function createWindow() {
