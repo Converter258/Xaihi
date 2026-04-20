@@ -1,9 +1,14 @@
-import { useCallback, useEffect, useMemo, useState } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import MonacoEditor from "./components/MonacoEditor";
 import TerminalView from "./components/TerminalView";
 
 const defaultRootPath = "\\\\wsl.localhost\\Ubuntu-22.04\\home";
 const emptyFileHint = "// 请在左侧文件树中选择一个文件。";
+const TERMINAL_WIDTH_STORAGE_KEY = "xaihi.terminal.width";
+const TERMINAL_MIN_WIDTH = 280;
+const TERMINAL_MAX_RATIO = 0.5;
+const TERMINAL_DEFAULT_WIDTH = 360;
+const TERMINAL_COLLAPSED_WIDTH = 48;
 
 const extensionLanguageMap = {
   js: "javascript",
@@ -41,6 +46,24 @@ function inferLanguageByPath(filePath) {
 
   const extension = filePath.split(".").pop()?.toLowerCase() ?? "";
   return extensionLanguageMap[extension] ?? "plaintext";
+}
+
+function clampTerminalWidth(width, viewportWidth = window.innerWidth) {
+  const maxWidth = Math.max(TERMINAL_MIN_WIDTH, Math.floor(viewportWidth * TERMINAL_MAX_RATIO));
+  return Math.min(Math.max(width, TERMINAL_MIN_WIDTH), maxWidth);
+}
+
+function getInitialTerminalWidth() {
+  if (typeof window === "undefined") {
+    return TERMINAL_DEFAULT_WIDTH;
+  }
+
+  const savedWidth = Number.parseInt(localStorage.getItem(TERMINAL_WIDTH_STORAGE_KEY) ?? "", 10);
+  if (Number.isNaN(savedWidth)) {
+    return clampTerminalWidth(TERMINAL_DEFAULT_WIDTH);
+  }
+
+  return clampTerminalWidth(savedWidth);
 }
 
 function createTreeNode(entry) {
@@ -138,9 +161,12 @@ function App() {
   const [lastSavedValue, setLastSavedValue] = useState(emptyFileHint);
   const [isFileLoading, setFileLoading] = useState(false);
   const [isSaving, setSaving] = useState(false);
-  const [statusMessage, setStatusMessage] = useState("就绪");
+  const [statusMessage, setStatusMessage] = useState("");
+  const [isStatusBarCollapsed, setStatusBarCollapsed] = useState(true);
+  const [terminalWidth, setTerminalWidth] = useState(() => getInitialTerminalWidth());
+  const [isResizing, setResizing] = useState(false);
+  const terminalWidthRef = useRef(terminalWidth);
 
-  const userName = useMemo(() => window.xaihi?.appName ?? "Xaihi IDE", []);
   const apiReady = Boolean(window.xaihi?.wsl);
   const activeLanguage = useMemo(() => inferLanguageByPath(activeFilePath), [activeFilePath]);
   const activeFileName = useMemo(
@@ -148,6 +174,7 @@ function App() {
     [activeFilePath],
   );
   const isDirty = Boolean(activeFilePath) && editorValue !== lastSavedValue;
+  const hasStatusError = statusMessage.trim().length > 0;
 
   const updateNodeByPath = useCallback((targetPath, updater) => {
     setRootNode((prev) => updateTreeNode(prev, targetPath, updater));
@@ -185,7 +212,7 @@ function App() {
       setActiveFilePath("");
       setEditorValue(emptyFileHint);
       setLastSavedValue(emptyFileHint);
-      setStatusMessage(`正在加载目录：${normalizedPath}`);
+      setStatusMessage("");
 
       try {
         const children = await listDirectory(normalizedPath);
@@ -195,7 +222,7 @@ function App() {
           isLoaded: true,
           children,
         });
-        setStatusMessage(`目录加载完成：${normalizedPath}`);
+        setStatusMessage("");
       } catch (error) {
         const errorMessage = error instanceof Error ? error.message : "目录加载失败。";
         setRootNode({
@@ -231,6 +258,7 @@ function App() {
           isExpanded: true,
           children,
         }));
+        setStatusMessage("");
       } catch (error) {
         const errorMessage = error instanceof Error ? error.message : "目录读取失败。";
         updateNodeByPath(node.path, (current) => ({
@@ -252,13 +280,12 @@ function App() {
       }
 
       setFileLoading(true);
-      setStatusMessage(`正在读取文件：${node.path}`);
       try {
         const result = await window.xaihi.wsl.readFile(node.path);
         setActiveFilePath(result.path);
         setEditorValue(result.content);
         setLastSavedValue(result.content);
-        setStatusMessage(`文件已打开：${result.path}`);
+        setStatusMessage("");
       } catch (error) {
         const errorMessage = error instanceof Error ? error.message : "文件读取失败。";
         setStatusMessage(`读取失败：${errorMessage}`);
@@ -275,14 +302,13 @@ function App() {
     }
 
     setSaving(true);
-    setStatusMessage(`正在保存：${activeFilePath}`);
     try {
       await window.xaihi.wsl.writeFile({
         path: activeFilePath,
         content: editorValue,
       });
       setLastSavedValue(editorValue);
-      setStatusMessage(`保存成功：${activeFilePath}`);
+      setStatusMessage("");
     } catch (error) {
       const errorMessage = error instanceof Error ? error.message : "保存失败。";
       setStatusMessage(`保存失败：${errorMessage}`);
@@ -291,11 +317,24 @@ function App() {
     }
   }, [activeFilePath, editorValue]);
 
+  const handleResizerMouseDown = useCallback(
+    (event) => {
+      if (isTerminalCollapsed) {
+        return;
+      }
+
+      event.preventDefault();
+      setResizing(true);
+    },
+    [isTerminalCollapsed],
+  );
+
   useEffect(() => {
     if (!apiReady) {
       setStatusMessage("当前环境未注入 IPC，请通过 Electron 启动应用。");
       return;
     }
+    setStatusMessage("");
     void loadRootDirectory(defaultRootPath);
   }, [apiReady, loadRootDirectory]);
 
@@ -311,11 +350,56 @@ function App() {
     return () => window.removeEventListener("keydown", onKeyDown);
   }, [handleSaveFile]);
 
+  useEffect(() => {
+    terminalWidthRef.current = terminalWidth;
+  }, [terminalWidth]);
+
+  useEffect(() => {
+    const onWindowResize = () => {
+      setTerminalWidth((previous) => clampTerminalWidth(previous));
+    };
+
+    window.addEventListener("resize", onWindowResize);
+    return () => window.removeEventListener("resize", onWindowResize);
+  }, []);
+
+  useEffect(() => {
+    if (!isResizing) {
+      return undefined;
+    }
+
+    const onMouseMove = (event) => {
+      const nextWidth = clampTerminalWidth(window.innerWidth - event.clientX);
+      setTerminalWidth(nextWidth);
+    };
+
+    const onMouseUp = () => {
+      setResizing(false);
+      localStorage.setItem(TERMINAL_WIDTH_STORAGE_KEY, String(terminalWidthRef.current));
+    };
+
+    document.body.style.cursor = "col-resize";
+    document.body.style.userSelect = "none";
+    window.addEventListener("mousemove", onMouseMove);
+    window.addEventListener("mouseup", onMouseUp);
+
+    return () => {
+      document.body.style.cursor = "";
+      document.body.style.userSelect = "";
+      window.removeEventListener("mousemove", onMouseMove);
+      window.removeEventListener("mouseup", onMouseUp);
+    };
+  }, [isResizing]);
+
   return (
-    <div className="flex h-screen w-screen flex-col bg-vscode-bg text-vscode-text">
+    <div className="relative flex h-screen w-screen flex-col bg-vscode-bg text-vscode-text">
       <header className="flex h-10 items-center justify-between border-b border-vscode-border bg-[#2d2d2d] px-4 text-xs uppercase tracking-wide text-vscode-muted">
-        <div className="font-medium">{userName}</div>
-        <div>WSL 文件编辑模式</div>
+        <div className="h-4 w-24" />
+        <div className="flex items-center gap-2">
+          <span className="h-3 w-3 rounded-sm border border-vscode-border bg-[#3a3a3a]" />
+          <span className="h-3 w-3 rounded-sm border border-vscode-border bg-[#3a3a3a]" />
+          <span className="h-3 w-3 rounded-sm border border-vscode-border bg-[#3a3a3a]" />
+        </div>
       </header>
 
       <main className="flex min-h-0 flex-1">
@@ -394,10 +478,20 @@ function App() {
           </div>
         </section>
 
+        <div
+          className={`w-1 shrink-0 border-l border-r border-vscode-border transition-colors ${
+            isTerminalCollapsed
+              ? "cursor-default bg-vscode-border/40"
+              : "cursor-col-resize bg-vscode-border/60 hover:bg-vscode-accent"
+          } ${isResizing ? "bg-vscode-accent" : ""}`}
+          onMouseDown={handleResizerMouseDown}
+        />
+
         <section
-          className={`${
-            isTerminalCollapsed ? "w-12" : "w-80"
-          } flex shrink-0 flex-col border-l border-vscode-border bg-vscode-panel transition-all duration-200`}
+          className="flex shrink-0 flex-col border-l border-vscode-border bg-vscode-panel transition-[width] duration-150"
+          style={{
+            width: isTerminalCollapsed ? TERMINAL_COLLAPSED_WIDTH : terminalWidth,
+          }}
         >
           <div className="flex h-10 items-center justify-between border-b border-vscode-border px-3 text-xs uppercase tracking-wider text-vscode-muted">
             {!isTerminalCollapsed && <span>Terminal</span>}
@@ -409,17 +503,32 @@ function App() {
               {isTerminalCollapsed ? "«" : "»"}
             </button>
           </div>
-          {!isTerminalCollapsed && (
-            <div className="min-h-0 flex-1 p-2">
-              <TerminalView />
-            </div>
-          )}
+          <div
+            className="min-h-0 flex-1 p-2"
+            style={{ display: isTerminalCollapsed ? "none" : "block" }}
+          >
+            <TerminalView visible={!isTerminalCollapsed} panelWidth={terminalWidth} />
+          </div>
         </section>
       </main>
 
-      <footer className="flex h-7 items-center border-t border-vscode-border bg-[#007acc] px-3 text-xs text-white">
-        {statusMessage}
-      </footer>
+      {!isStatusBarCollapsed && (
+        <footer className="flex h-7 items-center border-t border-vscode-border bg-vscode-panel px-3 text-xs text-vscode-muted">
+          {statusMessage || "无状态消息"}
+        </footer>
+      )}
+
+      <button
+        type="button"
+        className={`absolute bottom-2 right-3 z-20 h-7 rounded border px-2 text-[11px] uppercase tracking-wide transition ${
+          hasStatusError && isStatusBarCollapsed
+            ? "border-red-500 bg-red-600/20 text-red-200 hover:bg-red-600/30"
+            : "border-vscode-border bg-[#2d2d2d] text-vscode-muted hover:bg-vscode-hover"
+        }`}
+        onClick={() => setStatusBarCollapsed((value) => !value)}
+      >
+        {isStatusBarCollapsed ? "状态栏 ▴" : "状态栏 ▾"}
+      </button>
     </div>
   );
 }

@@ -1,10 +1,49 @@
-import { useEffect, useRef } from "react";
+import { useCallback, useEffect, useRef } from "react";
 import { FitAddon } from "@xterm/addon-fit";
 import { Terminal } from "@xterm/xterm";
 import "@xterm/xterm/css/xterm.css";
 
-function TerminalView() {
+function TerminalView({ visible, panelWidth }) {
   const terminalElementRef = useRef(null);
+  const terminalRef = useRef(null);
+  const fitAddonRef = useRef(null);
+  const terminalApiRef = useRef(null);
+
+  const syncFit = useCallback(async () => {
+    const terminal = terminalRef.current;
+    const fitAddon = fitAddonRef.current;
+    const terminalApi = terminalApiRef.current;
+    const terminalElement = terminalElementRef.current;
+
+    if (!terminal || !fitAddon || !terminalElement || terminalElement.offsetParent === null) {
+      return;
+    }
+
+    fitAddon.fit();
+
+    if (!terminalApi) {
+      return;
+    }
+
+    await terminalApi.resize({
+      cols: terminal.cols,
+      rows: terminal.rows,
+    });
+  }, []);
+
+  const scheduleFit = useCallback(() => {
+    if (!visible) {
+      return;
+    }
+
+    requestAnimationFrame(() => {
+      requestAnimationFrame(() => {
+        void syncFit().catch(() => {
+          // Ignore resize races while terminal is mounting or hidden.
+        });
+      });
+    });
+  }, [syncFit, visible]);
 
   useEffect(() => {
     if (!terminalElementRef.current) {
@@ -28,24 +67,12 @@ function TerminalView() {
     const fitAddon = new FitAddon();
     terminal.loadAddon(fitAddon);
     terminal.open(terminalElementRef.current);
-    const sendResize = async () => {
-      fitAddon.fit();
-      if (!window.xaihi?.terminal) {
-        return;
-      }
-
-      try {
-        await window.xaihi.terminal.resize({
-          cols: terminal.cols,
-          rows: terminal.rows,
-        });
-      } catch (error) {
-        // Ignore occasional resize race conditions during mount/unmount.
-      }
-    };
+    terminalRef.current = terminal;
+    fitAddonRef.current = fitAddon;
 
     terminal.writeln("正在连接 WSL 终端...");
     const terminalApi = window.xaihi?.terminal;
+    terminalApiRef.current = terminalApi ?? null;
     if (!terminalApi) {
       terminal.writeln("\r\n[错误] 未找到终端 IPC，请通过 Electron 启动应用。");
       return () => {
@@ -53,13 +80,23 @@ function TerminalView() {
       };
     }
 
+    const triggerFit = () => {
+      requestAnimationFrame(() => {
+        requestAnimationFrame(() => {
+          void syncFit().catch(() => {
+            // Ignore resize races while terminal is mounting or hidden.
+          });
+        });
+      });
+    };
+
     const onResize = () => {
-      void sendResize();
+      triggerFit();
     };
     window.addEventListener("resize", onResize);
 
     const resizeObserver = new ResizeObserver(() => {
-      void sendResize();
+      triggerFit();
     });
     resizeObserver.observe(terminalElementRef.current);
 
@@ -85,7 +122,7 @@ function TerminalView() {
         cols: terminal.cols,
         rows: terminal.rows,
       })
-      .then(() => sendResize())
+      .then(() => triggerFit())
       .catch((error) => {
         const message = error instanceof Error ? error.message : "启动终端失败。";
         terminal.write(`\r\n[错误] ${message}\r\n`);
@@ -99,9 +136,16 @@ function TerminalView() {
       unsubscribeExit();
       unsubscribeError();
       void terminalApi.stop().catch(() => {});
+      terminalRef.current = null;
+      fitAddonRef.current = null;
+      terminalApiRef.current = null;
       terminal.dispose();
     };
-  }, []);
+  }, [syncFit]);
+
+  useEffect(() => {
+    scheduleFit();
+  }, [visible, panelWidth, scheduleFit]);
 
   return <div ref={terminalElementRef} className="h-full w-full rounded border border-vscode-border" />;
 }
