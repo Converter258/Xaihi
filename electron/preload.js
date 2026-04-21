@@ -11,6 +11,13 @@ function createEventSubscription(channel, callback) {
 contextBridge.exposeInMainWorld("xaihi", {
   appName: "Xaihi IDE",
   openSettingsWindow: () => ipcRenderer.invoke("window:open-settings"),
+  windowControls: {
+    minimize: () => ipcRenderer.invoke("window:minimize"),
+    close: () => ipcRenderer.invoke("window:close"),
+    toggleMaximize: () => ipcRenderer.invoke("window:toggle-maximize"),
+    isMaximized: () => ipcRenderer.invoke("window:is-maximized"),
+    onMaximizeChanged: (callback) => createEventSubscription("window:maximize-changed", callback),
+  },
   wsl: {
     listDirectory: (dirPath) => ipcRenderer.invoke("wsl:list-directory", dirPath),
     readFile: (filePath) => ipcRenderer.invoke("wsl:read-file", filePath),

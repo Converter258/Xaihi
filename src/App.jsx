@@ -270,6 +270,7 @@ function App() {
   const [isResizing, setResizing] = useState(false);
   const [contextMenu, setContextMenu] = useState(null);
   const [clipboardEntry, setClipboardEntry] = useState(null);
+  const [isWindowMaximized, setWindowMaximized] = useState(false);
   const terminalWidthRef = useRef(terminalWidth);
 
   const apiReady = Boolean(window.xaihi?.wsl);
@@ -786,6 +787,63 @@ function App() {
     }
   }, []);
 
+  const getWindowControlsApi = useCallback(() => {
+    const windowControls = window.xaihi?.windowControls;
+    if (
+      !windowControls?.minimize ||
+      !windowControls?.close ||
+      !windowControls?.toggleMaximize ||
+      !windowControls?.isMaximized ||
+      !windowControls?.onMaximizeChanged
+    ) {
+      throw new Error("窗口控制 IPC 未就绪，请通过 Electron 启动应用。");
+    }
+
+    return windowControls;
+  }, []);
+
+  const handleMinimizeWindow = useCallback(async () => {
+    try {
+      const windowControls = getWindowControlsApi();
+      await windowControls.minimize();
+    } catch (error) {
+      const errorMessage = error instanceof Error ? error.message : "最小化窗口失败。";
+      setStatusMessage(errorMessage);
+    }
+  }, [getWindowControlsApi]);
+
+  const handleToggleMaximizeWindow = useCallback(async () => {
+    try {
+      const windowControls = getWindowControlsApi();
+      const result = await windowControls.toggleMaximize();
+      setWindowMaximized(Boolean(result?.isMaximized));
+    } catch (error) {
+      const errorMessage = error instanceof Error ? error.message : "切换窗口大小失败。";
+      setStatusMessage(errorMessage);
+    }
+  }, [getWindowControlsApi]);
+
+  const handleCloseWindow = useCallback(async () => {
+    try {
+      const windowControls = getWindowControlsApi();
+      await windowControls.close();
+    } catch (error) {
+      const errorMessage = error instanceof Error ? error.message : "关闭窗口失败。";
+      setStatusMessage(errorMessage);
+    }
+  }, [getWindowControlsApi]);
+
+  const handleHeaderDoubleClick = useCallback(
+    (event) => {
+      if (event.target instanceof Element && event.target.closest("[data-no-drag='true']")) {
+        return;
+      }
+
+      void handleToggleMaximizeWindow();
+    },
+    [handleToggleMaximizeWindow],
+  );
+
   useEffect(() => {
     if (!apiReady) {
       setStatusMessage("当前环境未注入 IPC，请通过 Electron 启动应用。");
@@ -794,6 +852,35 @@ function App() {
     setStatusMessage("");
     void loadRootDirectory(defaultRootPath);
   }, [apiReady, loadRootDirectory]);
+
+  useEffect(() => {
+    if (!window.xaihi?.windowControls) {
+      return undefined;
+    }
+
+    let isMounted = true;
+    const windowControls = window.xaihi.windowControls;
+
+    void windowControls
+      .isMaximized()
+      .then((payload) => {
+        if (isMounted) {
+          setWindowMaximized(Boolean(payload?.isMaximized));
+        }
+      })
+      .catch(() => {});
+
+    const unsubscribe = windowControls.onMaximizeChanged((payload) => {
+      if (isMounted) {
+        setWindowMaximized(Boolean(payload?.isMaximized));
+      }
+    });
+
+    return () => {
+      isMounted = false;
+      unsubscribe();
+    };
+  }, []);
 
   useEffect(() => {
     const onKeyDown = (event) => {
@@ -891,18 +978,52 @@ function App() {
 
   return (
     <div className="relative flex h-screen w-screen flex-col bg-vscode-bg text-vscode-text">
-      <header className="flex h-10 items-center justify-between border-b border-vscode-border bg-[#2d2d2d] px-4 text-xs uppercase tracking-wide text-vscode-muted">
+      <header
+        className="flex h-10 items-center justify-between border-b border-vscode-border bg-[#2d2d2d] px-2 text-xs uppercase tracking-wide text-vscode-muted"
+        style={{ WebkitAppRegion: "drag" }}
+        onDoubleClick={handleHeaderDoubleClick}
+      >
         <button
           type="button"
+          data-no-drag="true"
           className="h-7 rounded px-3 text-[11px] font-medium normal-case text-vscode-text hover:bg-vscode-hover"
+          style={{ WebkitAppRegion: "no-drag" }}
+          onDoubleClick={(event) => event.stopPropagation()}
           onClick={() => void handleOpenSettingsWindow()}
         >
           Options
         </button>
-        <div className="flex items-center gap-2">
-          <span className="h-3 w-3 rounded-sm border border-vscode-border bg-[#3a3a3a]" />
-          <span className="h-3 w-3 rounded-sm border border-vscode-border bg-[#3a3a3a]" />
-          <span className="h-3 w-3 rounded-sm border border-vscode-border bg-[#3a3a3a]" />
+
+        <div
+          data-no-drag="true"
+          className="flex items-center"
+          style={{ WebkitAppRegion: "no-drag" }}
+          onDoubleClick={(event) => event.stopPropagation()}
+        >
+          <button
+            type="button"
+            className="flex h-9 w-12 items-center justify-center text-sm text-vscode-text hover:bg-vscode-hover"
+            onClick={() => void handleMinimizeWindow()}
+            title="最小化"
+          >
+            —
+          </button>
+          <button
+            type="button"
+            className="flex h-9 w-12 items-center justify-center text-[12px] text-vscode-text hover:bg-vscode-hover"
+            onClick={() => void handleToggleMaximizeWindow()}
+            title={isWindowMaximized ? "还原" : "最大化"}
+          >
+            {isWindowMaximized ? "❐" : "□"}
+          </button>
+          <button
+            type="button"
+            className="flex h-9 w-12 items-center justify-center text-[12px] text-vscode-text hover:bg-red-600 hover:text-white"
+            onClick={() => void handleCloseWindow()}
+            title="关闭"
+          >
+            ×
+          </button>
         </div>
       </header>
 

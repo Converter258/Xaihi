@@ -327,6 +327,54 @@ function registerIpcHandlers() {
     createSettingsWindow(parentWindow ?? undefined);
     return { ok: true };
   });
+
+  ipcMain.handle("window:minimize", async (event) => {
+    const targetWindow = BrowserWindow.fromWebContents(event.sender);
+    if (!targetWindow) {
+      throw new Error("未找到窗口实例，无法最小化。");
+    }
+
+    targetWindow.minimize();
+    return { ok: true };
+  });
+
+  ipcMain.handle("window:close", async (event) => {
+    const targetWindow = BrowserWindow.fromWebContents(event.sender);
+    if (!targetWindow) {
+      throw new Error("未找到窗口实例，无法关闭。");
+    }
+
+    targetWindow.close();
+    return { ok: true };
+  });
+
+  ipcMain.handle("window:toggle-maximize", async (event) => {
+    const targetWindow = BrowserWindow.fromWebContents(event.sender);
+    if (!targetWindow) {
+      throw new Error("未找到窗口实例，无法切换最大化。");
+    }
+
+    if (targetWindow.isMaximized()) {
+      targetWindow.unmaximize();
+    } else {
+      targetWindow.maximize();
+    }
+
+    return {
+      isMaximized: targetWindow.isMaximized(),
+    };
+  });
+
+  ipcMain.handle("window:is-maximized", async (event) => {
+    const targetWindow = BrowserWindow.fromWebContents(event.sender);
+    if (!targetWindow) {
+      return { isMaximized: false };
+    }
+
+    return {
+      isMaximized: targetWindow.isMaximized(),
+    };
+  });
 }
 
 function sendToRenderer(webContentsId, channel, payload) {
@@ -393,6 +441,7 @@ function createWindow() {
     height: 960,
     minWidth: 1100,
     minHeight: 680,
+    frame: false,
     backgroundColor: "#1e1e1e",
     autoHideMenuBar: true,
     title: "Xaihi IDE",
@@ -402,6 +451,19 @@ function createWindow() {
       nodeIntegration: false,
     },
   });
+
+  const emitMaximizeChanged = () => {
+    if (mainWindow.isDestroyed()) {
+      return;
+    }
+
+    mainWindow.webContents.send("window:maximize-changed", {
+      isMaximized: mainWindow.isMaximized(),
+    });
+  };
+
+  mainWindow.on("maximize", emitMaximizeChanged);
+  mainWindow.on("unmaximize", emitMaximizeChanged);
 
   if (isDev) {
     mainWindow.loadURL("http://127.0.0.1:5173");
